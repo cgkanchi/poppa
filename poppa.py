@@ -16,7 +16,7 @@ TYPE_MAPPER = {int: 'INTEGER', np.int64: 'INTEGER', np.int32: 'INTEGER', np.obje
 DB_DEBUG = False
 
 
-class PaPoDataFrame(object):
+class PoppaDataFrame(object):
     '''PostgreSQL-backed DataFrame-like class. Allows arbitrary PostgreSQL queries to be run against data and provides
     convenience methods to load data into tables. Allows results of a query to be retrieved into a pandas DataFrame'''
 
@@ -36,8 +36,9 @@ class PaPoDataFrame(object):
 
     def apply_to_col(self, col, func, *args, **kwargs):
         coldata = self.query(columns=[self.columns[col]])
-        coldata[col].apply(func, *args, **kwargs)
-        return coldata[col]
+        # from IPython.core.debugger import Tracer;Tracer()()
+        coldata.set_index('_index_', inplace=True)
+        return coldata[col].apply(func, *args, **kwargs)
 
     def read_csv(self, csvfile, nrows=10, persist=False, drop=False, indexes=None, header='infer', *args, **kwargs):
         '''Load a CSV file into postgres into a temp (optionally not a temp) table and set appropriate indexes'''
@@ -87,7 +88,7 @@ class PaPoDataFrame(object):
         base_value = '({}, {})'
         values = []
         for i, v in value.iterrows():
-            values.append(base_value.format(v['_index_'], v['temp_val']))
+            values.append(base_value.format('{}::bigint'.format(v['_index_']), v['temp_val']))
         values = ','.join(values)
 
         if key not in self.columns:
@@ -97,38 +98,92 @@ class PaPoDataFrame(object):
         if key not in self.columns:
             self._exec_sql('CREATE INDEX ON "{tblname}" ({colname})'.format(tblname=self.name, colname=key))
 
-        self.columns.update(key=col)
+        self.columns.update({key: col})
 
-    def _translate_query(self, query=None, columns=None, joins=None):
+    def _translate_query(self, query=None, columns=None, joins=None, distinct=None, no_index=False, fresh_index=False):
         if columns is not None:
-            if '_index_' not in columns:
+            if '_index_' not in columns and not no_index:
                 columns = [column('_index_')] + columns
-        columns = columns or [text('*')]
+        else:
+            columns = [self.columns[c] for c in self.columns if c != '_index_']
+            if '_index_' not in columns and not no_index:
+                columns = [column('_index_')] + columns
 
         if not isinstance(query, list) and not isinstance(query, tuple) and query is not None:
             query = [query]
         q = select(columns).select_from(text(self.name))
+        if distinct:
+            q = q.distinct(*distinct)
         if joins:
             q = q.join(*joins)
         if query:
             q = q.where(and_(*query))
         q = q.compile(dialect=postgresql.dialect(param_style='named'))
-        return q.__str__(), q.params
+        qstr = q.__str__()
 
+        if fresh_index:
+            # wrap query in SELECT row_number() call
+            alias = self._get_rand_str()
+            qstr = 'SELECT row_number() over (order by NULL) as _index_, * FROM ({q}) as {alias}'.format(q=qstr, alias=alias)
+
+        return qstr, q.params
+
+
+    def group_apply(self, group_by, func, col_subset, as_temp=True, *args, **kwargs):
+        # first get all distincts for the group
+        gb = [column(g) for g in group_by]
+        group_df = self.query(columns=gb, distinct=gb, no_index=True, fresh_index=True)
+
+        pdfs = []
+        for i, row in group_df.iterrows():
+            #TODO: parallelize
+            # select each group into a temp table
+            row_dict = row.to_dict()
+            row_dict.pop('_index_')
+            qcond = []
+            for key in row_dict:
+                qcond.append(column(key) == row_dict[key])
+
+            pdfs.append(self.query(qcond, as_temp=True, no_index=True, fresh_index=True))
+            self.conn.commit()
+            for col in col_subset:
+                pdfs[-1]['result_1'] = pdfs[-1].apply_to_col(col, func, *args, **kwargs)
+
+        # first create a temp_table
+        final_temp_name = self._get_rand_str()
+        pdf = pdfs[0]
+        self._exec_sql('CREATE TEMP TABLE "{}" AS (SELECT * from "{}")'.format(final_temp_name, pdf.name))
+        for i, pdf in enumerate(pdfs[1:]):
+            p_cols = ','.join(pdf.columns)
+            self._exec_sql('INSERT INTO "{tblname}" ({p_cols}) (SELECT {p_cols} FROM {tbl2})'.format(tblname=final_temp_name, p_cols=p_cols, tbl2=pdf.name))
+            self.conn.commit()
+
+        final_pdf = PoppaDataFrame(name=final_temp_name, connection=self.conn, cursor=self.cursor, columns=self._get_columns_from_db(final_temp_name))
+        final_pdf.reset_index()
+
+        return final_pdf
+
+    def reset_index(self):
+        seq_name = '{}__index__seq'.format(self.name)
+
+        self._exec_sql('ALTER TABLE {} DROP COLUMN _index_'.format(self.name))
+        self._exec_sql('ALTER TABLE {} ADD COLUMN _index_ BIGSERIAL'.format(self.name))
+        self._exec_sql("SELECT setval('{}', 1, FALSE)".format(seq_name))
+        self._exec_sql("UPDATE {} SET _index_=nextval('{}')".format(self.name, seq_name))
 
     def _get_rand_str(self, nchars=30):
         return ''.join(itertools.chain.from_iterable(random.sample(ascii_lowercase, 1) for i in range(nchars)))
 
-    def query(self, query=None, columns=None, group_by=None, as_temp=False):
+    def query(self, query=None, columns=None, group_by=None, as_temp=False, distinct=None, no_index=False, fresh_index=False):
         '''Query a table. If as_temp is True, put results into a temp table instead and return a PaPoDF on that temp table instead'''
-        q, p = self._translate_query(query, columns)
+        q, p = self._translate_query(query, columns, distinct=distinct, no_index=no_index, fresh_index=fresh_index)
         if as_temp:
             temp_table_name = self._get_rand_str()
             q = 'CREATE TEMP TABLE "{tblname}" AS ({query})'.format(tblname=temp_table_name, query=q)
         self._exec_sql(q, None, p)
 
         if as_temp:
-            return PaPoDataFrame(temp_table_name, self.conn, self.cursor, self._get_columns_from_db(temp_table_name))
+            return PoppaDataFrame(temp_table_name, self.conn, self.cursor, self._get_columns_from_db(temp_table_name))
         else:
             df = pd.DataFrame(self.cursor.fetchall())
             df.columns = [c.name for c in self.cursor.description]
