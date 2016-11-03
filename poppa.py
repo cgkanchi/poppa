@@ -40,6 +40,20 @@ class PoppaDataFrame(object):
         coldata.set_index('_index_', inplace=True)
         return coldata[col].apply(func, *args, **kwargs)
 
+    def persist(self):
+        tblname = self._get_rand_str()
+        self._exec_sql('CREATE TABLE "{}" AS (SELECT * FROM "{}")'.format(tblname, self.name))
+        for c in self.columns:
+            self._exec_sql('CREATE INDEX ON {}({})'.format(tblname, c))
+        self._exec_sql('DROP TABLE "{}"'.format(self.name))
+        self._exec_sql('ALTER TABLE "{}" RENAME TO "{}"'.format(tblname, self.name))
+        self.conn.commit()
+
+
+    def read_table(self):
+        self.columns = self._get_columns_from_db(self.name)
+
+
     def read_csv(self, csvfile, nrows=10, persist=False, drop=False, indexes=None, header='infer', *args, **kwargs):
         '''Load a CSV file into postgres into a temp (optionally not a temp) table and set appropriate indexes'''
         parse_dates = kwargs.pop('parse_dates', True)
@@ -76,6 +90,16 @@ class PoppaDataFrame(object):
         # create columns to allow querying
         self.columns = {c: column(c) for c in df.columns}
 
+    @staticmethod
+    def _chunk_iter(iterable, chunksize):
+        i = 0
+        while True:
+            chunk = iterable[i: i+ chunksize]
+            i += chunksize
+            if chunk:
+                yield chunk
+            else:
+                raise StopIteration
 
     def __getitem__(self, key):
         return self.columns[key]
@@ -89,12 +113,18 @@ class PoppaDataFrame(object):
         values = []
         for i, v in value.iterrows():
             values.append(base_value.format('{}::bigint'.format(v['_index_']), v['temp_val']))
-        values = ','.join(values)
 
         if key not in self.columns:
             self._exec_sql('ALTER TABLE "{tblname}" ADD COLUMN {colname} {coltype}'.format(tblname=self.name, colname=key, coltype=TYPE_MAPPER[value['temp_val'].dtype.type]))
-        self._exec_sql('''UPDATE "{tblname}" AS t SET {colname} = c.{colname} FROM (VALUES {values})
-                          AS c(_index_, {colname}) WHERE c._index_ = t._index_'''.format(tblname=self.name, colname=key, values=values))
+        for values_chunk in PoppaDataFrame._chunk_iter(values, 1000):
+            values_chunk = ','.join(values_chunk)
+            try:
+                sql = '''UPDATE "{tblname}" AS t SET {colname} = c.{colname} FROM (VALUES {values})
+                         AS c(_index_, {colname}) WHERE c._index_ = t._index_'''.format(tblname=self.name, colname=key, values=values_chunk)
+                self._exec_sql(sql)
+            except Exception:
+                print(sql)
+                raise
         if key not in self.columns:
             self._exec_sql('CREATE INDEX ON "{tblname}" ({colname})'.format(tblname=self.name, colname=key))
 
