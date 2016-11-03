@@ -13,40 +13,45 @@ TYPE_MAPPER = {int: 'INTEGER', np.int64: 'INTEGER', np.int32: 'INTEGER', np.obje
                str: 'TEXT', bytes: 'TEXT', np.datetime64: 'TIMESTAMPTZ', datetime: 'TIMESTAMPTZ', bool: 'BOOLEAN'}
 
 
-DB_DEBUG = False
+DB_DEBUG = True
 
 
 class PoppaDataFrame(object):
     '''PostgreSQL-backed DataFrame-like class. Allows arbitrary PostgreSQL queries to be run against data and provides
     convenience methods to load data into tables. Allows results of a query to be retrieved into a pandas DataFrame'''
 
-    def __init__(self, name, connection, cursor=None, columns=None):
+    def __init__(self, name, connection, columns=None):
         self.name = name
         self.conn = connection
-        self.cursor = cursor or self.conn.cursor()
+        self.conn.autocommit = True
         self.columns = columns
 
-    def _exec_sql(self, sql, method=None, *args, **kwargs):
-        if not method:
-            method = self.cursor.execute
-
-        method(sql, *args, **kwargs)
-        if DB_DEBUG:
-            print(self.cursor.query)
+    def _exec_sql(self, sql, cursor, *args, **kwargs):
+        try:
+            cursor.execute(sql, *args, **kwargs)
+        finally:
+            if DB_DEBUG:
+                print(cursor.query)
+        return cursor
 
     def apply_to_col(self, col, func, *args, **kwargs):
         coldata = self.query(columns=[self.columns[col]])
-        # from IPython.core.debugger import Tracer;Tracer()()
         coldata.set_index('_index_', inplace=True)
         return coldata[col].apply(func, *args, **kwargs)
 
-    def persist(self):
-        tblname = self._get_rand_str()
-        self._exec_sql('CREATE TABLE "{}" AS (SELECT * FROM "{}")'.format(tblname, self.name))
-        for c in self.columns:
-            self._exec_sql('CREATE INDEX ON {}({})'.format(tblname, c))
-        self._exec_sql('DROP TABLE "{}"'.format(self.name))
-        self._exec_sql('ALTER TABLE "{}" RENAME TO "{}"'.format(tblname, self.name))
+    def persist(self, name=None):
+        if not name:
+            name = self.name
+
+        tblname = self._get_rand_str() if name == self.name else name
+        with self.conn:
+            with self.conn.cursor() as cursor:
+                self._exec_sql('CREATE TABLE "{}" AS (SELECT * FROM "{}")'.format(tblname, self.name), cursor)
+                for c in self.columns:
+                    self._exec_sql('CREATE INDEX ON {}({})'.format(tblname, c), cursor)
+                if name == self.name:
+                    self._exec_sql('DROP TABLE "{}"'.format(self.name), cursor)
+                    self._exec_sql('ALTER TABLE "{}" RENAME TO "{}"'.format(tblname, self.name), cursor)
         self.conn.commit()
 
 
@@ -58,7 +63,9 @@ class PoppaDataFrame(object):
         '''Load a CSV file into postgres into a temp (optionally not a temp) table and set appropriate indexes'''
         parse_dates = kwargs.pop('parse_dates', True)
         if drop:
-            self._exec_sql('DROP TABLE IF EXISTS "{}"'.format(self.name))
+            with self.conn:
+                with self.conn.cursor() as cursor:
+                    self._exec_sql('DROP TABLE IF EXISTS "{}"'.format(self.name), cursor)
         # take a small slice of the csv file and load into a pandas dataframe - then infer types and map to relevant PG types
         # note that arbitrary objects are NOT supported
         prefix = 'anon_' if header is None else None
@@ -74,16 +81,23 @@ class PoppaDataFrame(object):
         persist = 'TEMP' if not persist else ''
         # TODO put primary key here
         create_table = 'CREATE {persist} TABLE IF NOT EXISTS "{tblname}" ({col_spec})'.format(persist=persist, tblname=self.name, col_spec=col_spec)
-        self._exec_sql(create_table)
-        self._exec_sql('DELETE FROM "{tblname}"'.format(tblname=self.name))
+        with self.conn:
+            with self.conn.cursor() as cursor:
+                self._exec_sql(create_table, cursor)
+                self._exec_sql('DELETE FROM "{tblname}"'.format(tblname=self.name), cursor)
+
         header = 'HEADER' if header is not None else ''
         copy_stmt = 'COPY "{tblname}" ({colnames}) FROM STDIN CSV {header}'.format(tblname=self.name, colnames=','.join([c[0] for c in col_types][1:]), csvfile=csvfile, header=header)
         with open(csvfile) as f:
-            self._exec_sql(copy_stmt, self.cursor.copy_expert, f)
+            with self.conn:
+                with self.conn.cursor() as cursor:
+                    cursor.copy_expert(copy_stmt, f)
 
         indexes = indexes or df.columns
         for c in indexes:
-            self._exec_sql('CREATE INDEX ON {}({})'.format(self.name, c))
+            with self.conn:
+                with self.conn.cursor() as cursor:
+                    self._exec_sql('CREATE INDEX ON {}({})'.format(self.name, c), cursor)
 
         self.conn.commit()
 
@@ -115,18 +129,26 @@ class PoppaDataFrame(object):
             values.append(base_value.format('{}::bigint'.format(v['_index_']), v['temp_val']))
 
         if key not in self.columns:
-            self._exec_sql('ALTER TABLE "{tblname}" ADD COLUMN {colname} {coltype}'.format(tblname=self.name, colname=key, coltype=TYPE_MAPPER[value['temp_val'].dtype.type]))
+            with self.conn:
+                with self.conn.cursor() as cursor:
+                    self._exec_sql('ALTER TABLE "{tblname}" ADD COLUMN {colname} {coltype}'.format(
+                                   tblname=self.name, colname=key, coltype=TYPE_MAPPER[value['temp_val'].dtype.type]), cursor)
+
         for values_chunk in PoppaDataFrame._chunk_iter(values, 1000):
             values_chunk = ','.join(values_chunk)
             try:
                 sql = '''UPDATE "{tblname}" AS t SET {colname} = c.{colname} FROM (VALUES {values})
                          AS c(_index_, {colname}) WHERE c._index_ = t._index_'''.format(tblname=self.name, colname=key, values=values_chunk)
-                self._exec_sql(sql)
+                with self.conn:
+                    with self.conn.cursor() as cursor:
+                        self._exec_sql(sql, cursor)
             except Exception:
                 print(sql)
                 raise
         if key not in self.columns:
-            self._exec_sql('CREATE INDEX ON "{tblname}" ({colname})'.format(tblname=self.name, colname=key))
+                with self.conn:
+                    with self.conn.cursor() as cursor:
+                        self._exec_sql('CREATE INDEX ON "{tblname}" ({colname})'.format(tblname=self.name, colname=key), cursor)
 
         self.columns.update({key: col})
 
@@ -182,24 +204,28 @@ class PoppaDataFrame(object):
         # first create a temp_table
         final_temp_name = self._get_rand_str()
         pdf = pdfs[0]
-        self._exec_sql('CREATE TEMP TABLE "{}" AS (SELECT * from "{}")'.format(final_temp_name, pdf.name))
-        for i, pdf in enumerate(pdfs[1:]):
-            p_cols = ','.join(pdf.columns)
-            self._exec_sql('INSERT INTO "{tblname}" ({p_cols}) (SELECT {p_cols} FROM {tbl2})'.format(tblname=final_temp_name, p_cols=p_cols, tbl2=pdf.name))
-            self.conn.commit()
+        with self.conn:
+            with self.conn.cursor() as cursor:
+                self._exec_sql('CREATE TEMP TABLE "{}" AS (SELECT * from "{}")'.format(final_temp_name, pdf.name), cursor)
+                self.conn.commit()
+                for i, pdf in enumerate(pdfs[1:]):
+                    p_cols = ','.join(pdf.columns)
+                    self._exec_sql('INSERT INTO "{tblname}" ({p_cols}) (SELECT {p_cols} FROM {tbl2})'.format(tblname=final_temp_name, p_cols=p_cols, tbl2=pdf.name), cursor)
+                    self.conn.commit()
 
-        final_pdf = PoppaDataFrame(name=final_temp_name, connection=self.conn, cursor=self.cursor, columns=self._get_columns_from_db(final_temp_name))
+        final_pdf = PoppaDataFrame(name=final_temp_name, connection=self.conn, columns=self._get_columns_from_db(final_temp_name))
         final_pdf.reset_index()
-
         return final_pdf
 
     def reset_index(self):
         seq_name = '{}__index__seq'.format(self.name)
 
-        self._exec_sql('ALTER TABLE {} DROP COLUMN _index_'.format(self.name))
-        self._exec_sql('ALTER TABLE {} ADD COLUMN _index_ BIGSERIAL'.format(self.name))
-        self._exec_sql("SELECT setval('{}', 1, FALSE)".format(seq_name))
-        self._exec_sql("UPDATE {} SET _index_=nextval('{}')".format(self.name, seq_name))
+        with self.conn:
+            with self.conn.cursor() as cursor:
+                self._exec_sql('ALTER TABLE {} DROP COLUMN _index_'.format(self.name), cursor)
+                self._exec_sql('ALTER TABLE {} ADD COLUMN _index_ BIGSERIAL'.format(self.name), cursor)
+                self._exec_sql("SELECT setval('{}', 1, FALSE)".format(seq_name), cursor)
+                self._exec_sql("UPDATE {} SET _index_=nextval('{}')".format(self.name, seq_name), cursor)
 
     def _get_rand_str(self, nchars=30):
         return ''.join(itertools.chain.from_iterable(random.sample(ascii_lowercase, 1) for i in range(nchars)))
@@ -210,19 +236,24 @@ class PoppaDataFrame(object):
         if as_temp:
             temp_table_name = self._get_rand_str()
             q = 'CREATE TEMP TABLE "{tblname}" AS ({query})'.format(tblname=temp_table_name, query=q)
-        self._exec_sql(q, None, p)
+        with self.conn:
+            with self.conn.cursor() as cursor:
+                self._exec_sql(q, cursor, p)
+                self.conn.commit()
 
-        if as_temp:
-            return PoppaDataFrame(temp_table_name, self.conn, self.cursor, self._get_columns_from_db(temp_table_name))
-        else:
-            df = pd.DataFrame(self.cursor.fetchall())
-            df.columns = [c.name for c in self.cursor.description]
-            return df
+                if as_temp:
+                    return PoppaDataFrame(temp_table_name, self.conn, self._get_columns_from_db(temp_table_name))
+                else:
+                    df = pd.DataFrame(cursor.fetchall())
+                    df.columns = [c.name for c in cursor.description]
+                    return df
 
     def _get_columns_from_db(self, tblname):
-        self.cursor.execute('SELECT * FROM "{tblname}" LIMIT 1'.format(tblname=tblname))
-        self.cursor.fetchall()
-        return {c.name: column(c.name) for c in self.cursor.description}
+        with self.conn:
+            with self.conn.cursor() as cursor:
+                cursor.execute('SELECT * FROM "{tblname}" LIMIT 1'.format(tblname=tblname))
+                cursor.fetchall()
+                return {c.name: column(c.name) for c in cursor.description}
 
 
 
