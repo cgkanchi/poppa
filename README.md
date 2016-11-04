@@ -1,4 +1,4 @@
-# poppa
+# PoPPa
 A Python library that leverages PostgreSQL to solve medium-data problems
 
 ## Introduction
@@ -30,3 +30,13 @@ Example:
     # in a subsequent session, one can then:
     pdf = poppa.PoppaDataFrame(name='some_name')
     pdf.read_table()
+
+## TODO
+
+- Clean up code, make interface more like Pandas (in-progress)
+- Add ability to apply arbitrary SQL expressions to data without pulling it into Python (in-progress)
+- Add unit tests
+- Better error handling
+- Add ability to join multiple PoppaDataFrames using SQL joins
+- Use SQLAlchemy to build queries everywhere (for features that SA doesn't support, still build most of the query with SA and inject additional SQL into the str)
+- Python 2 support
