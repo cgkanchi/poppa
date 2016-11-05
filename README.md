@@ -40,3 +40,5 @@ Example:
 - Add ability to join multiple PoppaDataFrames using SQL joins
 - Use SQLAlchemy to build queries everywhere (for features that SA doesn't support, still build most of the query with SA and inject additional SQL into the str)
 - Python 2 support
+- Add transparent int indexing/slicing support - i.e. pdf[10:20] should just work and return a pandas DF - this will allow PoPPa to be transparently used in place of a pandas DF in some places
+- Add loop support (for i in pdf and for i, row in pdf.iterrows())
